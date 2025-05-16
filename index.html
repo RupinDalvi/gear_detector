@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bike Gear MVP</title>
+  <style>
+    body {font-family: Arial, sans-serif;margin:0;padding:1rem;}
+    h1{margin-top:0;}
+    label{display:block;margin:0.5rem 0 0.25rem;}
+    input[type="text"],input[type="number"]{width:100%;padding:0.4rem;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;}
+    button{margin-top:1rem;padding:0.6rem 1rem;border:none;border-radius:4px;cursor:pointer;background:#007bff;color:#fff;font-size:1rem;}
+    button:disabled{background:#999;cursor:not-allowed;}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;}
+    #liveDisplay{font-size:1.5rem;margin-top:1rem;}
+    table{width:100%;border-collapse:collapse;margin-top:1rem;}
+    th,td{border:1px solid #ddd;padding:0.5rem;text-align:center;}
+    .inline{display:inline-block;margin-right:1rem;}
+  </style>
+</head>
+<body>
+  <h1>Bike Gear MVP (1‑s sampling – no shift detector)</h1>
+
+  <section id="setupSection">
+    <p><strong>Step 0:</strong> Choose data source.</p>
+    <div class="inline"><label><input type="radio" name="dataMode" value="real" checked> Real sensors</label></div>
+    <div class="inline"><label><input type="radio" name="dataMode" value="sim"> Simulated data</label></div>
+
+    <p style="margin-top:1.5rem;"><strong>Step 1:</strong> Connect to your cadence (and optional speed) sensor <em>(real‑mode only)</em>.</p>
+    <button id="connectBtn">Connect BLE Sensor</button>
+
+    <p style="margin-top:1.5rem;"><strong>Step 2:</strong> Enter your drivetrain & wheel info.</p>
+    <div class="grid">
+      <div>
+        <label for="chainringsInput">Front chainrings (teeth, comma‑separated)</label>
+        <input id="chainringsInput" type="text" placeholder="e.g. 50,34" value="50,34">
+      </div>
+      <div>
+        <label for="cassetteInput">Cassette cogs (teeth, comma‑separated)</label>
+        <input id="cassetteInput" type="text" placeholder="e.g. 11,12,13,14,15,17,19,21,23,25,28" value="11,12,13,15,17,19,21,23,25,28,32">
+      </div>
+    </div>
+    <label for="wheelCircInput">Wheel circumference in metres (default 2.105 m for 700×25c)</label>
+    <input id="wheelCircInput" type="number" step="0.001" value="2.105">
+
+    <button id="startRideBtn" disabled>Start Ride</button>
+  </section>
+
+  <section id="liveSection" style="display:none;">
+    <h2>Live Ride</h2>
+    <div id="liveDisplay">Waiting for data…</div>
+    <button id="stopRideBtn">Stop &amp; Save Ride</button>
+  </section>
+
+  <section id="summarySection" style="display:none;">
+    <h2>Ride Summary</h2>
+    <div id="summaryStats"></div>
+    <button id="downloadBtn">Download JSON Log</button>
+  </section>
+
+  <script>
+    //---------------- State ----------------
+    let cadenceCharacteristic = null;
+    let wheelCharacteristic = null;
+
+    let cadenceRpm = 0;
+    let wheelRpm = null; // null until available
+
+    let lastCrankRev=null,lastCrankEventTime=null;
+    let lastWheelRev=null,lastWheelEventTime=null;
+
+    let wheelCirc=2.105; // metres
+    let chainrings=[],cassette=[],gearTable=[];
+    let log=[];
+
+    let timer=null,geolocWatch=null;
+    let simulation=false;
+    let simState={gear:null,baseCadence:85};
+
+    //---------------- UI ----------------
+    const connectBtn=document.getElementById('connectBtn');
+    const startRideBtn=document.getElementById('startRideBtn');
+    const stopRideBtn=document.getElementById('stopRideBtn');
+    const downloadBtn=document.getElementById('downloadBtn');
+    const liveDisplay=document.getElementById('liveDisplay');
+    const summaryStats=document.getElementById('summaryStats');
+
+    // Enable/disable controls based on mode selection
+    document.querySelectorAll('input[name="dataMode"]').forEach(radio=>{
+      radio.addEventListener('change',()=>{
+        simulation = document.querySelector('input[name="dataMode"]:checked').value==='sim';
+        connectBtn.style.display = simulation? 'none':'inline-block';
+        if(simulation){
+          connectBtn.textContent='Connect BLE Sensor';
+          startRideBtn.disabled=false;
+        }else{
+          startRideBtn.disabled=true;
+          connectBtn.style.display='inline-block';
+        }
+      });
+    });
+
+    //---------------- BLE connection (real mode) ----------------
+    connectBtn.addEventListener('click',async()=>{
+      try{
+        const device=await navigator.bluetooth.requestDevice({filters:[{services:['cycling_speed_and_cadence']}]});
+        const server=await device.gatt.connect();
+        const service=await server.getPrimaryService('cycling_speed_and_cadence');
+        const characteristic=await service.getCharacteristic('cycling_speed_and_cadence');
+        cadenceCharacteristic=characteristic;
+        await characteristic.startNotifications();
+        characteristic.addEventListener('characteristicvaluechanged',handleCscMeasurement);
+        connectBtn.textContent='Sensor Connected ✔';
+        startRideBtn.disabled=false;
+      }catch(err){console.error(err);alert('BLE connection failed: '+err);}
+    });
+
+    function handleCscMeasurement(event){
+      const data=event.target.value;
+      const flags=data.getUint8(0);
+      let idx=1;
+      const wheelPresent=flags&0x01;
+      const crankPresent=flags&0x02;
+      if(wheelPresent){
+        const rev=data.getUint32(idx,true);idx+=4;
+        const t=data.getUint16(idx,true);idx+=2;
+        if(lastWheelRev!==null){
+          const revDiff=rev-lastWheelRev;
+          const tDiff=(t-lastWheelEventTime)&0xFFFF;
+          if(revDiff>0&&tDiff>0) wheelRpm=(revDiff/(tDiff/1024))*60;
+        }
+        lastWheelRev=rev;lastWheelEventTime=t;
+      }
+      if(crankPresent){
+        const rev=data.getUint16(idx,true);idx+=2;
+        const t=data.getUint16(idx,true);idx+=2;
+        if(lastCrankRev!==null){
+          const revDiff=(rev-lastCrankRev)&0xFFFF;
+          const tDiff=(t-lastCrankEventTime)&0xFFFF;
+          if(revDiff>0&&tDiff>0) cadenceRpm=(revDiff/(tDiff/1024))*60;
+        }
+        lastCrankRev=rev;lastCrankEventTime=t;
+      }
+    }
+
+    //---------------- Geolocation fallback ----------------
+    function startGeolocation(){
+      if(!navigator.geolocation) return;
+      let lastPos=null;
+      geolocWatch=navigator.geolocation.watchPosition(pos=>{
+        if(lastPos){
+          const dt=(pos.timestamp-lastPos.timestamp)/1000;
+          const dist=haversine(lastPos.coords.latitude,lastPos.coords.longitude,pos.coords.latitude,pos.coords.longitude);
+          const speedMps=dist/dt;
+          wheelRpm=(speedMps/wheelCirc)*60;
+        }
+        lastPos=pos;
+      },err=>console.warn('Geo err',err),{enableHighAccuracy:true,maximumAge:1000,timeout:5000});
+    }
+    function haversine(lat1,lon1,lat2,lon2){const R=6371000;const rad=x=>x*Math.PI/180;const dLat=rad(lat2-lat1);const dLon=rad(lon2-lon1);const a=Math.sin(dLat/2)**2+Math.cos(rad(lat1))*Math.cos(rad(lat2))*Math.sin(dLon/2)**2;return 2*R*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));}
+
+    //---------------- Gear helpers ----------------
+    function buildGearTable(){gearTable=[];chainrings.forEach(f=>cassette.forEach(r=>gearTable.push({front:f,rear:r,ratio:r/f})))}
+    function nearestGear(ratio){let best=null,diff=Infinity;gearTable.forEach(g=>{const d=Math.abs(g.ratio-ratio);if(d<diff){diff=d;best=g;}});return best;}
+
+    //---------------- Ride controls ----------------
+    startRideBtn.addEventListener('click',()=>{
+      chainrings=document.getElementById('chainringsInput').value.split(',').map(x=>parseInt(x.trim())).filter(x=>!isNaN(x));
+      cassette=document.getElementById('cassetteInput').value.split(',').map(x=>parseInt(x.trim())).filter(x=>!isNaN(x));
+      wheelCirc=parseFloat(document.getElementById('wheelCircInput').value)||2.105;
+      if(chainrings.length===0||cassette.length===0){alert('Enter valid drivetrain');return;}
+      buildGearTable();
+      simulation=document.querySelector('input[name="dataMode"]:checked').value==='sim';
+      document.getElementById('setupSection').style.display='none';
+      document.getElementById('liveSection').style.display='block';
+      if(simulation){initSimulation();}else{startGeolocation();}
+      timer=setInterval(sampleTick,1000);
+    });
+
+    stopRideBtn.addEventListener('click',()=>{if(timer)clearInterval(timer);if(geolocWatch)navigator.geolocation.clearWatch(geolocWatch);document.getElementById('liveSection').style.display='none';showSummary();});
+
+    //---------------- Simulation ----------------
+    function initSimulation(){simState.gear=gearTable[Math.floor(Math.random()*gearTable.length)];simState.baseCadence=80+Math.random()*20;}
+    function simulateData(){// random cadence noise & occasional shifts
+      if(Math.random()<0.1){simState.gear=gearTable[Math.floor(Math.random()*gearTable.length)];}
+      const noise=(Math.random()-0.5)*6;cadenceRpm=Math.max(60,simState.baseCadence+noise);
+      wheelRpm=cadenceRpm*simState.gear.ratio*(1+ (Math.random()-0.5)*0.02); // small noise
+    }
+
+    //---------------- Sampling loop ----------------
+    function sampleTick(){
+      if(simulation)simulateData();
+      const now=Date.now();
+      if(wheelRpm===null||cadenceRpm===0)return; // waiting for data
+      const ratioRaw=wheelRpm/cadenceRpm;
+      const gear=nearestGear(ratioRaw);
+      liveDisplay.innerHTML=`Gear: <strong>${gear.front} × ${gear.rear}</strong><br>Cadence: ${cadenceRpm.toFixed(0)} rpm<br>Speed: ${(wheelRpm*wheelCirc/60*3.6).toFixed(1)} km/h`;
+      log.push({t:now,cadence:cadenceRpm,wheelRpm,gearFront:gear.front,gearRear:gear.rear});
+    }
+
+    //---------------- Summary ----------------
+    function showSummary(){const counts={};log.forEach(e=>{const k=`${e.gearFront}x${e.gearRear}`;counts[k]=(counts[k]||0)+1;});
+      const rows=Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([g,cnt])=>{const pct=(cnt/log.length*100).toFixed(1);return`<tr><td>${g.replace('x',' × ')}</td><td>${cnt}</td><td>${pct}%</td></tr>`;}).join('');
+      summaryStats.innerHTML=`<p>Total samples: ${log.length}</p><table><tr><th>Gear</th><th>Samples</th><th>Usage %</th></tr>${rows}</table>`;
+      document.getElementById('summarySection').style.display='block';}
+    downloadBtn.addEventListener('click',()=>{const blob=new Blob([JSON.stringify(log)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`gear_log_${new Date().toISOString()}.json`;a.click();URL.revokeObjectURL(url);});
+  </script>
+</body>
+</html>
