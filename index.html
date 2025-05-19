@@ -106,7 +106,7 @@
         const device=await navigator.bluetooth.requestDevice({filters:[{services:['cycling_speed_and_cadence']}]});
         const server=await device.gatt.connect();
         const service=await server.getPrimaryService('cycling_speed_and_cadence');
-        const characteristic=await service.getCharacteristic('cycling_speed_and_cadence');
+        const characteristic=await service.getCharacteristic('00002a5b-0000-1000-8000-00805f9b34fb');
         cadenceCharacteristic=characteristic;
         await characteristic.startNotifications();
         characteristic.addEventListener('characteristicvaluechanged',handleCscMeasurement);
